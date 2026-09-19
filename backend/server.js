@@ -4,8 +4,8 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcrypt');
-const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
+const { DatabaseSync } = require('node:sqlite');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
@@ -42,21 +42,21 @@ app.use((req, res, next) => {
 // ==========================================
 // 2. SQLITE DATABASE SETUP
 // ==========================================
-const db = new Database('./robosurge.db');
-db.pragma('journal_mode = WAL');
+const db = new DatabaseSync('./robosurge.db');
+db.exec('PRAGMA journal_mode = WAL;');
 
 // Create Users Table
-db.prepare(`
+db.exec(`
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         role TEXT NOT NULL
-    )
-`).run();
+    );
+`);
 
 // Create Jobs Table (SQLite Background Worker Queue)
-db.prepare(`
+db.exec(`
     CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL,
@@ -64,12 +64,12 @@ db.prepare(`
         status TEXT NOT NULL DEFAULT 'pending',
         result TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-`).run();
+    );
+`);
 
 // Default Admin User
 const adminExists = db.prepare(`SELECT count(*) as count FROM users`).get();
-if (adminExists.count === 0) {
+if (!adminExists || adminExists.count === 0) {
     const hash = bcrypt.hashSync('admin123', 10);
     db.prepare(`INSERT INTO users (username, password, role) VALUES (?, ?, ?)`).run('admin', hash, 'admin');
     console.log("Created default admin user (admin / admin123)");
@@ -99,11 +99,27 @@ const authMiddleware = (allowedRoles = []) => {
     };
 };
 
+app.post('/auth/register', (req, res) => {
+    const { username, password, role } = req.body;
+    if (!username || !password) return res.status(400).json({ error: "Username and password are required" });
+
+    const userRole = (role === 'admin' || role === 'doctor' || role === 'surgeon') ? role : 'doctor';
+    try {
+        const hash = bcrypt.hashSync(password, 10);
+        db.prepare(`INSERT INTO users (username, password, role) VALUES (?, ?, ?)`).run(username, hash, userRole);
+        const newUser = db.prepare(`SELECT * FROM users WHERE username = ?`).get(username);
+        const token = jwt.sign({ id: newUser.id, username: newUser.username, role: newUser.role }, JWT_SECRET, { expiresIn: '24h' });
+        res.json({ token, role: newUser.role, username: newUser.username, message: "Registered successfully" });
+    } catch (e) {
+        res.status(400).json({ error: "Could not create user (username may already exist)" });
+    }
+});
+
 app.post('/auth/signup', authMiddleware(['admin']), (req, res) => {
     const { username, password, role } = req.body;
     if (!username || !password) return res.status(400).json({ error: "Missing fields" });
 
-    const userRole = (role === 'admin' || role === 'doctor') ? role : 'doctor';
+    const userRole = (role === 'admin' || role === 'doctor' || role === 'surgeon') ? role : 'doctor';
     try {
         const hash = bcrypt.hashSync(password, 10);
         db.prepare(`INSERT INTO users (username, password, role) VALUES (?, ?, ?)`).run(username, hash, userRole);
@@ -122,7 +138,11 @@ app.post('/auth/login', (req, res) => {
     }
 
     const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, role: user.role });
+    res.json({ token, role: user.role, username: user.username });
+});
+
+app.get('/auth/me', authMiddleware(['admin', 'doctor']), (req, res) => {
+    res.json({ user: req.user });
 });
 
 // ==========================================
@@ -131,10 +151,8 @@ app.post('/auth/login', (req, res) => {
 const secureApi = express.Router();
 secureApi.use(authMiddleware(['admin', 'doctor']));
 
-// Transparent Proxies
+// Transparent Camera Stream Proxy
 secureApi.use('/camera/feed', createProxyMiddleware({ target: PYTHON_BACKEND, changeOrigin: true }));
-secureApi.use('/execute', createProxyMiddleware({ target: PYTHON_BACKEND, changeOrigin: true }));
-secureApi.use('/abort', createProxyMiddleware({ target: PYTHON_BACKEND, changeOrigin: true }));
 
 // NL Translation Interceptor for /status
 let globalLastPlanStr = "";
@@ -145,19 +163,24 @@ secureApi.get('/status', async (req, res) => {
         const data = await r.json();
 
         if (data.planning && data.planning.plan) {
-            const currentPlanStr = JSON.stringify(data.planning.plan);
-            
-            if (currentPlanStr !== globalLastPlanStr) {
-                globalLastPlanStr = currentPlanStr;
-                // Add a job to our SQLite queue
-                db.prepare(`INSERT INTO jobs (type, payload, status) VALUES (?, ?, ?)`).run('translate_plan', currentPlanStr, 'pending');
-                console.log("[Queue] Added translation job for new procedure plan.");
-            }
+            // If the doctor has explicitly edited the brief, prioritize it and do not overwrite with auto-translation
+            if (data.planning.is_doctor_edited && data.planning.doctor_brief) {
+                data.planning.nl_translation = data.planning.doctor_brief;
+            } else {
+                const currentPlanStr = JSON.stringify(data.planning.plan);
+                
+                if (currentPlanStr !== globalLastPlanStr) {
+                    globalLastPlanStr = currentPlanStr;
+                    // Add a job to our SQLite queue
+                    db.prepare(`INSERT INTO jobs (type, payload, status) VALUES (?, ?, ?)`).run('translate_plan', currentPlanStr, 'pending');
+                    console.log("[Queue] Added translation job for new procedure plan.");
+                }
 
-            // Fetch the most recent completed translation job for this plan
-            const latestJob = db.prepare(`SELECT result FROM jobs WHERE type = 'translate_plan' AND status = 'completed' AND payload = ? ORDER BY id DESC LIMIT 1`).get(currentPlanStr);
-            if (latestJob && latestJob.result) {
-                data.planning.nl_translation = latestJob.result;
+                // Fetch the most recent completed translation job for this plan
+                const latestJob = db.prepare(`SELECT result FROM jobs WHERE type = 'translate_plan' AND status = 'completed' AND payload = ? ORDER BY id DESC LIMIT 1`).get(currentPlanStr);
+                if (latestJob && latestJob.result) {
+                    data.planning.nl_translation = latestJob.result;
+                }
             }
         } else {
             globalLastPlanStr = "";
@@ -184,6 +207,76 @@ secureApi.post('/command', async (req, res) => {
     }
 });
 
+// Doctor Brief Update Endpoint
+secureApi.post('/plan/update-brief', async (req, res) => {
+    try {
+        const r = await fetch(PYTHON_BACKEND + '/api/plan/update-brief', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body)
+        });
+        const data = await r.json();
+        res.status(r.status).json(data);
+    } catch(e) {
+        res.status(500).json({ error: "Failed to update doctor brief" });
+    }
+});
+
+// Execute Endpoint
+secureApi.post('/execute', async (req, res) => {
+    try {
+        const r = await fetch(PYTHON_BACKEND + '/api/execute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body || {})
+        });
+        const data = await r.json();
+        res.status(r.status).json(data);
+    } catch(e) {
+        res.status(500).json({ error: "Failed to execute plan" });
+    }
+});
+
+// Abort Endpoint
+secureApi.post('/abort', async (req, res) => {
+    try {
+        const r = await fetch(PYTHON_BACKEND + '/api/abort', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body || {})
+        });
+        const data = await r.json();
+        res.status(r.status).json(data);
+    } catch(e) {
+        res.status(500).json({ error: "Failed to send abort" });
+    }
+});
+
+// Calibration Endpoints
+secureApi.get('/calibration', async (req, res) => {
+    try {
+        const r = await fetch(PYTHON_BACKEND + '/api/calibration');
+        const data = await r.json();
+        res.status(r.status).json(data);
+    } catch(e) {
+        res.status(500).json({ error: "Failed to fetch calibration" });
+    }
+});
+
+secureApi.post('/calibration/:action', async (req, res) => {
+    try {
+        const r = await fetch(`${PYTHON_BACKEND}/api/calibration/${req.params.action}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body || {})
+        });
+        const data = await r.json();
+        res.status(r.status).json(data);
+    } catch(e) {
+        res.status(500).json({ error: `Failed to update calibration: ${e.message}` });
+    }
+});
+
 app.use('/api', secureApi);
 
 // ==========================================
@@ -196,16 +289,11 @@ app.use('/', express.static('../frontend/dist'));
 // 6. SQLITE BACKGROUND QUEUE WORKER
 // ==========================================
 async function processQueue() {
-    // Transaction to safely pick up a job
-    const job = db.transaction(() => {
-        const pendingJob = db.prepare(`SELECT * FROM jobs WHERE status = 'pending' LIMIT 1`).get();
-        if (pendingJob) {
-            db.prepare(`UPDATE jobs SET status = 'processing' WHERE id = ?`).run(pendingJob.id);
-        }
-        return pendingJob;
-    })();
+    const pendingJob = db.prepare(`SELECT * FROM jobs WHERE status = 'pending' LIMIT 1`).get();
+    if (!pendingJob) return; // Queue is empty
 
-    if (!job) return; // Queue is empty
+    db.prepare(`UPDATE jobs SET status = 'processing' WHERE id = ?`).run(pendingJob.id);
+    const job = pendingJob;
 
     console.log(`[Worker] Processing Job #${job.id}: ${job.type}`);
     

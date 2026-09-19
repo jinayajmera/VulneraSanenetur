@@ -4,7 +4,7 @@ surgical_agent.py — RoboSurge Phase 4
 Groq LLM agent that converts a natural-language surgical command + SceneState
 into a structured ProcedurePlan JSON.
 
-Model: llama-3.3-70b-versatile via Groq API (same as Phase 1).
+Model: openai/gpt-oss-120b via Groq API.
 Output: strict JSON only — no freetext, no markdown, no preamble.
 
 Prompt architecture
@@ -21,7 +21,9 @@ USER    — assembled per call:
     • SceneState.to_prompt_block()   (arms + landmarks + workspace)
     • The natural-language command
 
-ASSISTANT seed — "({"  to force the model to begin the JSON object immediately.
+JSON mode — response_format={"type": "json_object"} forces the model to emit a
+single well-formed JSON object (replaces the old "{" assistant-seed trick, which
+reasoning models such as gpt-oss do not honour).
 
 Retry logic
 -----------
@@ -72,8 +74,8 @@ logger = logging.getLogger("SurgicalAgent")
 # Constants
 # ---------------------------------------------------------------------------
 
-GROQ_MODEL:  str = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
-MAX_TOKENS:  int = 2048
+GROQ_MODEL:  str = "openai/gpt-oss-120b"
+MAX_TOKENS:  int = 8192   # gpt-oss reasoning tokens count toward this budget
 TEMPERATURE: float = 0.0    # deterministic — surgical planning is not creative
 MAX_RETRIES: int = 3
 
@@ -367,12 +369,12 @@ class SurgicalAgent:
         logger.info("Planning command: %r", command)
 
         messages: list[dict] = [
-            {"role": "system",    "content": _SYSTEM_PROMPT},
-            {"role": "user",      "content": user_msg},
-            {"role": "assistant", "content": "{"},   # seed forces JSON-first output
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user",   "content": user_msg},
         ]
 
         last_error: Optional[Exception] = None
+        raw = ""
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -389,15 +391,14 @@ class SurgicalAgent:
                 logger.warning("Attempt %d parse failure: %s", attempt, exc)
                 if attempt < MAX_RETRIES:
                     # Feed the error back for self-correction
-                    messages.append({"role": "assistant", "content": "{" + raw})
+                    messages.append({"role": "assistant", "content": raw})
                     messages.append({
                         "role": "user",
                         "content": (
                             f"Your response was not valid JSON.  Error: {exc}\n"
-                            "Output ONLY the corrected JSON object, starting with {{"
+                            "Output ONLY the corrected JSON object."
                         ),
                     })
-                    messages.append({"role": "assistant", "content": "{"})
 
         raise SurgicalAgentError(
             f"LLM failed to produce valid ProcedurePlan JSON after "
@@ -417,7 +418,9 @@ class SurgicalAgent:
     def _call_groq(self, messages: list[dict]) -> str:
         """
         Call the Groq API and return the raw text content of the response.
-        The assistant seed '{' is prepended before parsing.
+
+        JSON mode guarantees the content is a single well-formed JSON object,
+        so no seeding or fence-stripping is needed on the happy path.
         """
         t0 = time.monotonic()
         response = self._client.chat.completions.create(
@@ -425,14 +428,13 @@ class SurgicalAgent:
             messages=messages,
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
+            response_format={"type": "json_object"},
         )
         elapsed = (time.monotonic() - t0) * 1000
         logger.debug("Groq API call: %.0f ms", elapsed)
 
         content = response.choices[0].message.content or ""
-        # The assistant seed '{' was injected but is NOT in the response content;
-        # we prepend it to reconstruct the full JSON object.
-        return "{" + content.strip()
+        return content.strip()
 
     def _parse_response(self, raw: str) -> ProcedurePlan:
         """

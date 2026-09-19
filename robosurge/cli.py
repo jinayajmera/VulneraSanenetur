@@ -81,7 +81,10 @@ from .vision_pipeline import PoseTracker
 
 from .landmark_detector import LandmarkDetector, LandmarkFrame
 from .scene_state import SceneState, ArmState, LandmarkState, TABLE_Z_CM, SAFE_Z_CM
-from .surgical_agent import ArmPlan, SurgicalAgent, ProcedurePlan, SurgicalAgentError, Waypoint
+from .surgical_agent import (
+    ArmPlan, SurgicalAgent, ProcedurePlan, SurgicalAgentError, Waypoint,
+    CAUTERIZATION_DWELL_S, SUTURE_CINCH_DWELL_S, DEFAULT_SUTURE_STITCHES,
+)
 from .procedure_validator import ProcedureValidator
 from .motion_executor import MotionExecutor, HOME_X, HOME_Y, HOME_Z
 from .kinematics_engine import ForwardKinematics
@@ -104,6 +107,10 @@ _DIM  = "\033[2m"
 TOOL_OFFSET_FILE = Path(__file__).resolve().parents[1] / "config" / "tool_offset.json"
 ROBOT_CALIBRATION_FILE = Path(__file__).resolve().parents[1] / "config" / "robot_calibration.json"
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
+
+# Debug snapshot of the live camera frame, refreshed at most this often.
+SNAPSHOT_PATH: str = "live_calib_check.png"
+SNAPSHOT_INTERVAL_S: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +171,7 @@ class VisionThread(threading.Thread):
         self._interval    = 1.0 / loop_hz
         self._stop_event  = threading.Event()
         self._frame_count = 0
+        self._last_snapshot_t = 0.0
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -182,19 +190,24 @@ class VisionThread(threading.Thread):
 
     def _tick(self) -> None:
         frame = self._tracker.grab_frame()
-        cv2.imwrite('live_calib_check.png', frame)
+
+        # Debug snapshot for eyeballing calibration against the live scene.
+        # This used to run unconditionally, i.e. a full PNG encode + disk write
+        # on every frame at the loop rate — and it passed frame=None straight
+        # to cv2.imwrite whenever a grab failed, raising once per tick. Once a
+        # second is plenty to inspect, and the guard keeps a dropped frame from
+        # turning into an error storm.
+        if frame is not None:
+            now = time.monotonic()
+            if now - self._last_snapshot_t >= SNAPSHOT_INTERVAL_S:
+                cv2.imwrite(SNAPSHOT_PATH, frame)
+                self._last_snapshot_t = now
+
         if self._frame_count <= 3:
-            logger.warning("LIVE FRAME SHAPE: %s", None if frame is None else frame.shape)
+            logger.debug("Live frame shape: %s", None if frame is None else frame.shape)
         self._frame_count += 1
 
-        # ── Arm detection ────────────────────────────────────────────────
-        # Arms are physically elevated above the cardboard plane.
-        # Homography is only valid for points ON the table surface, so
-        # projecting arm tip pixels gives nonsense coordinates.
-        # FK is the ground truth for arm positions — vision is used ONLY
-        # for landmark detection.  Once the ESP32 reports live angles via
-        # serial, replace HOME_X/Y/Z here with fk.calculate_fk(angles).
-        detections = self._tracker.process_frame(frame)  # still run for draw_pose()
+        # ── Arm states (FK datum) ────────────────────────────────────────
         arm_states: list[ArmState] = [
             ArmState(arm_id=1, x=HOME_X, y=HOME_Y, z=HOME_Z, source="FK"),
             ArmState(arm_id=2, x=HOME_X, y=HOME_Y, z=HOME_Z, source="FK"),
@@ -213,12 +226,11 @@ class VisionThread(threading.Thread):
             for d in lf.detections
         ]
 
-        # ── Annotated frame for optional display ─────────────────────────
+        # ── Annotated frame (Landmarks only, no skeleton lines) ──────────
         annotated = None
         if frame is not None:
             try:
-                annotated = self._tracker.draw_pose(frame, detections)
-                annotated = self._lm_detector.draw_landmarks(annotated, lf)
+                annotated = self._lm_detector.draw_landmarks(frame, lf)
             except Exception:  # noqa: BLE001
                 annotated = frame
 
@@ -425,10 +437,12 @@ def _print_result(results: dict) -> None:
 def _extract_target_landmark(command: str) -> str:
     """Return the landmark name mentioned in the command; default to A."""
     cmd = command.lower()
-    if "landmark b" in cmd or "landmark_b" in cmd or "target b" in cmd:
+    if re.search(r"\b(?:landmark|target)[\s_-]*b\b", cmd):
         return "landmark_B"
-    if "landmark c" in cmd or "landmark_c" in cmd or "target c" in cmd:
+    if re.search(r"\b(?:landmark|target)[\s_-]*c\b", cmd):
         return "landmark_C"
+    if re.search(r"\b(?:landmark|target)[\s_-]*a\b", cmd):
+        return "landmark_A"
     return "landmark_A"
 
 
@@ -436,6 +450,25 @@ def _extract_mm_value(command: str, default_mm: float = 3.0) -> float:
     """Extract the first '<number>mm' value from a natural-language command."""
     match = re.search(r"(\d+(?:\.\d+)?)\s*mm", command.lower())
     return float(match.group(1)) if match else default_mm
+
+
+def _extract_feed_rate(text: str, default_feed: float | None = None) -> float | None:
+    """Extract a feed rate like '2.5 mm/s' or '5 mm/s' from text if present."""
+    match = re.search(r"(\d+(?:\.\d+)?)\s*mm/s", text.lower())
+    if match:
+        return float(match.group(1))
+    return default_feed
+
+
+def _extract_depth_value(text: str, default_depth_cm: float | None = None) -> float | None:
+    """Extract explicit cut/plunge depth from text if present (e.g. 'depth of 0.2cm' or 'depth 3mm')."""
+    match_cm = re.search(r"depth\s*(?:of|=)?\s*(\d+(?:\.\d+)?)\s*cm", text.lower())
+    if match_cm:
+        return float(match_cm.group(1))
+    match_mm = re.search(r"depth\s*(?:of|=)?\s*(\d+(?:\.\d+)?)\s*mm", text.lower())
+    if match_mm:
+        return float(match_mm.group(1)) / 10.0
+    return default_depth_cm
 
 
 def _extract_stitch_count(command: str, default_n: int = 3) -> int:
@@ -503,7 +536,9 @@ def _repair_incision_plan(command: str, state: SceneState, plan: ProcedurePlan) 
         return plan
 
     incision_len_cm = _extract_mm_value(command, default_mm=3.0) / 10.0
-    cut_depth_cm = incision_len_cm
+    custom_depth = _extract_depth_value(command)
+    cut_depth_cm = custom_depth if custom_depth is not None else incision_len_cm
+
     start_x, start_y = _apply_robot_calibration(target.x, target.y)
     end_x = start_x + incision_len_cm
     end_y = start_y
@@ -515,10 +550,13 @@ def _repair_incision_plan(command: str, state: SceneState, plan: ProcedurePlan) 
     hold_y_candidates = [start_y + 7.0, start_y - 7.0]
     hold_y = min(hold_y_candidates, key=lambda y: math.hypot(start_x, y))
 
+    custom_feed = _extract_feed_rate(command)
+    feed_to_use = custom_feed if custom_feed is not None else plan.arm1.feed_rate_mm_s
+
     plan.arm1 = ArmPlan(
         arm_id=1,
         role="cutting",
-        feed_rate_mm_s=min(max(plan.arm1.feed_rate_mm_s, 1.0), 3.0),
+        feed_rate_mm_s=min(max(feed_to_use, 0.5), 15.0),
         waypoints=[
             Waypoint(x=start_x, y=start_y, z=SAFE_Z_CM, label="transit"),
             Waypoint(x=start_x, y=start_y, z=approach_z, label="approach"),
@@ -537,7 +575,7 @@ def _repair_incision_plan(command: str, state: SceneState, plan: ProcedurePlan) 
     )
     plan.safety_notes = (
         f"Deterministic incision repair: {incision_len_cm:.2f}cm drag at "
-        f"{target_name}; target=({start_x:+.2f},{start_y:+.2f})."
+        f"{target_name}; target=({start_x:+.2f},{start_y:+.2f}), depth={cut_depth_cm:.2f}cm."
     )
     return plan
 
@@ -559,14 +597,21 @@ def _repair_point_procedure_plan(
     if target is None:
         return plan
 
+    custom_depth = _extract_depth_value(command)
+    if custom_depth is not None:
+        depth_cm = custom_depth
+
     x, y = _apply_robot_calibration(target.x, target.y)
     approach_z = TABLE_Z_CM + 0.2
     plunge_z = TABLE_Z_CM - depth_cm
 
+    custom_feed = _extract_feed_rate(command)
+    feed_to_use = custom_feed if custom_feed is not None else plan.arm1.feed_rate_mm_s
+
     plan.arm1 = ArmPlan(
         arm_id=1,
         role="cutting",
-        feed_rate_mm_s=min(max(plan.arm1.feed_rate_mm_s, 1.0), 3.0),
+        feed_rate_mm_s=min(max(feed_to_use, 0.5), 15.0),
         waypoints=[
             Waypoint(x=x, y=y, z=SAFE_Z_CM, label="transit"),
             Waypoint(x=x, y=y, z=approach_z, label="approach"),
@@ -601,7 +646,6 @@ def _repair_biopsy_plan(command: str, state: SceneState, plan: ProcedurePlan) ->
 
 def _repair_cauterization_plan(command: str, state: SceneState, plan: ProcedurePlan) -> ProcedurePlan:
     """Cauterization: shallow contact, held for CAUTERIZATION_DWELL_S."""
-    from surgical_agent import CAUTERIZATION_DWELL_S
     return _repair_point_procedure_plan(
         command, state, plan, "cauterization",
         depth_cm=0.1, dwell_s=CAUTERIZATION_DWELL_S,
@@ -641,10 +685,13 @@ def _repair_debridement_plan(command: str, state: SceneState, plan: ProcedurePla
     last = sweep_wps[-1]
     sweep_wps.append(Waypoint(x=last.x, y=last.y, z=SAFE_Z_CM, label="retract"))
 
+    custom_feed = _extract_feed_rate(command)
+    feed_to_use = custom_feed if custom_feed is not None else plan.arm1.feed_rate_mm_s
+
     plan.arm1 = ArmPlan(
         arm_id=1,
         role="cutting",
-        feed_rate_mm_s=min(max(plan.arm1.feed_rate_mm_s, 2.0), 6.0),
+        feed_rate_mm_s=min(max(feed_to_use, 0.5), 15.0),
         waypoints=sweep_wps,
     )
     hold_y_candidates = [cy + half_w + 7.0, cy - half_w - 7.0]
@@ -678,8 +725,6 @@ def _repair_suturing_plan(command: str, state: SceneState, plan: ProcedurePlan) 
       stitch_depth_cm   = 0.15  (how far below the table the tip dips)
       loop_height_cm    = 0.8   (how high the arc rises above the table)
     """
-    from surgical_agent import SUTURE_CINCH_DWELL_S, DEFAULT_SUTURE_STITCHES
-
     if plan.procedure != "suturing":
         return plan
 
@@ -742,10 +787,13 @@ def _repair_suturing_plan(command: str, state: SceneState, plan: ProcedurePlan) 
     last_tug = tug_wps[-1]
     tug_wps.append(Waypoint(x=last_tug.x, y=hold_y, z=SAFE_Z_CM, label="release"))
 
+    custom_feed = _extract_feed_rate(command)
+    feed_to_use = custom_feed if custom_feed is not None else plan.arm1.feed_rate_mm_s
+
     plan.arm1 = ArmPlan(
         arm_id=1,
         role="cutting",
-        feed_rate_mm_s=min(max(plan.arm1.feed_rate_mm_s, 1.0), 2.5),
+        feed_rate_mm_s=min(max(feed_to_use, 0.5), 15.0),
         waypoints=wps,
     )
     plan.arm2 = ArmPlan(

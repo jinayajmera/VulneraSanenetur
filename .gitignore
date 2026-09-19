@@ -7,3 +7,11 @@ yolov8n-pose.pt
 runs/
 .vscode/
 node_modules/
+*.db-shm
+*.db-wal
+*warmup.png
+current_live_check.png
+live_calib_check.png
+test.db
+robosurge.db
+

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -523,15 +524,18 @@ class ProcedureValidator:
     def _resolve_incision_target(self, plan: ProcedurePlan) -> Optional[LandmarkState]:
         """Infer the intended target landmark from plan text or nearest plunge point."""
         haystack = f"{plan.rationale} {plan.safety_notes}".lower()
-        for name, labels in {
-            "landmark_A": ("landmark a", "landmark_a", "target a"),
-            "landmark_B": ("landmark b", "landmark_b", "target b"),
-            "landmark_C": ("landmark c", "landmark_c", "target c"),
-        }.items():
-            if any(label in haystack for label in labels):
-                lm = next((l for l in self._landmarks if l.name == name), None)
-                if lm is not None:
-                    return lm
+        if re.search(r"\b(?:landmark|target)[\s_-]*b\b", haystack):
+            lm = next((l for l in self._landmarks if l.name == "landmark_B"), None)
+            if lm is not None:
+                return lm
+        if re.search(r"\b(?:landmark|target)[\s_-]*c\b", haystack):
+            lm = next((l for l in self._landmarks if l.name == "landmark_C"), None)
+            if lm is not None:
+                return lm
+        if re.search(r"\b(?:landmark|target)[\s_-]*a\b", haystack):
+            lm = next((l for l in self._landmarks if l.name == "landmark_A"), None)
+            if lm is not None:
+                return lm
 
         plunge = next((w for w in plan.arm1.waypoints if w.label == "plunge"), None)
         if plunge is None:

@@ -126,7 +126,7 @@ def plan_procedure(command: str, client: Groq) -> dict:
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             temperature=0.1,
             max_tokens=4096,
             messages=[
@@ -134,7 +134,7 @@ def plan_procedure(command: str, client: Groq) -> dict:
                 {"role": "user", "content": command}
             ]
         )
-        print("  [model: llama-3.3-70b-versatile via Groq]")
+        print("  [model: openai/gpt-oss-120b via Groq]")
     except Exception as e:
         print(f"[error] Groq failed: {e}")
         sys.exit(1)
@@ -267,7 +267,7 @@ def main():
     print("\n╔══════════════════════════════════╗")
     print("║  RoboSurge Phase 1 — Agent CLI  ║")
     print("╚══════════════════════════════════╝")
-    print("Model : llama-3.3-70b via Groq (free)")
+    print("Model : openai/gpt-oss-120b via Groq (free)")
     print("Type a procedure or 'quit' to exit\n")
     print("Examples:")
     print("  make a 3mm incision horizontally")

@@ -21,7 +21,7 @@ Dual-arm robotic surgical system demo: type a natural-language command ("make a 
    natural-language command
               │
               ▼
-       SurgicalAgent ── Groq llama-3.3-70b ──► ProcedurePlan JSON (intent only)
+       SurgicalAgent ── Groq gpt-oss-120b ──► ProcedurePlan JSON (intent only)
               │
               ▼
    deterministic plan repair ── exact cut geometry rebuilt from landmarks

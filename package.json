@@ -1,0 +1,9 @@
+{
+  "name": "robosurge",
+  "version": "1.0.0",
+  "description": "RoboSurge System Launcher",
+  "scripts": {
+    "start": "python start.py",
+    "dev": "python start.py"
+  }
+}

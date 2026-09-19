@@ -32,6 +32,7 @@ LandmarkConfig.z_offset_cm accordingly.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -51,18 +52,28 @@ logger = logging.getLogger("LandmarkDetector")
 # Was previously a local hardcoded copy (7.5) that silently drifted out of
 # sync with scene_state.py's value. Now imports the single source of truth
 # so a future recalibration only has to change one number.
-from .scene_state import TABLE_Z_CM  # physical Z of table surface (same as FIXED_Z_CM)
+from .scene_state import TABLE_Z_CM, MIN_REACH, MAX_REACH  # physical Z of table surface (same as FIXED_Z_CM)
 
 # Minimum/maximum dot area in pixels to filter noise and large blobs
-MIN_DOT_AREA_PX: int = 100
-MAX_DOT_AREA_PX: int = 3000
+MIN_DOT_AREA_PX: int = 50
+MAX_DOT_AREA_PX: int = 5000
 
 # Calibrated pixel bounding box — detections outside this region are rejected
 # as false positives from background / servo hardware.
-PIXEL_BOUND_V_MIN: int = 380   # dots at v=437-492, servos at v=200-250
-PIXEL_BOUND_U_MIN: int = 200
-PIXEL_BOUND_U_MAX: int = 1100
-PIXEL_BOUND_V_MAX: int = 700
+PIXEL_BOUND_V_MIN: int = 250
+PIXEL_BOUND_U_MIN: int = 100
+PIXEL_BOUND_U_MAX: int = 1200
+PIXEL_BOUND_V_MAX: int = 720
+
+# Max reach allowed for landmark detection before hard rejection (with clamping)
+MAX_LANDMARK_REACH: float = 50.0
+
+# A dot parked outside the calibrated region is rejected on every frame, so at
+# the vision thread's ~10 Hz the warning scrolled the interactive prompt off
+# screen faster than it could be read. Log the first rejection per landmark
+# immediately, then at most one line per interval carrying the suppressed count
+# — the condition is static, so repeating it 10x/second adds nothing.
+REJECT_LOG_INTERVAL_S: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -101,40 +112,38 @@ class LandmarkConfig:
 # Default configs — tune S/V for your lighting with the interactive tuner
 LANDMARK_CONFIGS: list[LandmarkConfig] = [
 
+    # Bounds below are centred on measured dot statistics rather than guessed
+    # (see tools/diag_clutter.py). Previously the yellow dot sat at H=34.9
+    # against an upper bound of 35 and cyan at H=97.3 against 100 — both were
+    # one lighting shift away from dropping out of their own mask.
     LandmarkConfig(
-
         name="landmark_A",
-
-        # Yellow
-
-        hsv_lower=np.array([20, 100, 100], dtype=np.uint8),
-
-        hsv_upper=np.array([35, 255, 255], dtype=np.uint8),
-
+        # Yellow — measured H=34.9±0.5, S=128.8±6.7, V=212.6±1.8.
+        # H floor of 28 also rejects the H=23 clutter blob on the arm base.
+        hsv_lower=np.array([28,  90, 170], dtype=np.uint8),
+        hsv_upper=np.array([42, 255, 255], dtype=np.uint8),
         color_bgr=(0, 220, 220),
-
     ),
 
     LandmarkConfig(
-
         name="landmark_B",
-
-        # Cyan/teal
-
-        hsv_lower=np.array([80, 100, 80],  dtype=np.uint8),
-
-        hsv_upper=np.array([100, 255, 255], dtype=np.uint8),
-
+        # Cyan/teal — measured H=97.3±0.8, S=154.8±22.4, V=214.3±3.1.
+        # Upper bound stops at 103 rather than 108: there is background
+        # clutter at H=105.8 in the top-left of the frame, and 103 is still
+        # 6 sigma above the dot's own hue.
+        hsv_lower=np.array([86, 100, 150], dtype=np.uint8),
+        hsv_upper=np.array([103, 255, 255], dtype=np.uint8),
         color_bgr=(255, 200, 0),
-
     ),
 
     LandmarkConfig(
         name="landmark_C",
-        # Widened Purple (Adjusted to handle dark ink and overhead glare)
-        hsv_lower=np.array([115, 40, 40], dtype=np.uint8),
-        hsv_upper=np.array([165, 255, 255], dtype=np.uint8),
-        color_bgr=(200, 0, 200), # Purple for the display overlay
+        # Purple — measured H=122.8±2.4, S=108.9±17.9, V=204.2±10.2.
+        # The old S>=40, V>=40 floors let in a V=65 shadow blob; the real dot
+        # is three times brighter, so the V floor does the separating.
+        hsv_lower=np.array([112,  80, 130], dtype=np.uint8),
+        hsv_upper=np.array([138, 255, 255], dtype=np.uint8),
+        color_bgr=(200, 0, 200),
     ),
 
 ]
@@ -226,6 +235,12 @@ class LandmarkDetector:
             cv2.MORPH_ELLIPSE, (morph_ksize, morph_ksize)
         )
         self._frame_id: int = 0
+
+        # Per-landmark throttle state for the out-of-workspace warning:
+        # name -> monotonic timestamp of last emitted line, and the number of
+        # rejections swallowed since then.
+        self._reject_last_log:   dict[str, float] = {}
+        self._reject_suppressed: dict[str, int]   = {}
 
         logger.info(
             "LandmarkDetector ready.  Tracking %d colors: %s",
@@ -352,7 +367,7 @@ class LandmarkDetector:
             if perimeter < 1e-6:
                 continue
             circularity = (4.0 * np.pi * area) / (perimeter ** 2)
-            if circularity < 0.40:
+            if circularity < 0.25:
                 continue
             candidates.append((area, circularity, cnt))
 
@@ -378,11 +393,19 @@ class LandmarkDetector:
 
         # Step 7: pixel -> physical
         phys_x, phys_y = self._mapper.pixel_to_physical(cx, cy)
-        # Homography physical X is opposite the ESP32 IK command frame.
-        # Old working hardware tests use positive X as forward reach, so
-        # publish landmarks in the same command frame the robot executes.
-        phys_x = phys_x
         phys_z = TABLE_Z_CM + cfg.z_offset_cm
+
+        # Step 7.5: validate and soft-clamp physical reach
+        reach = math.hypot(phys_x, phys_y)
+        if not (0.5 <= reach <= MAX_LANDMARK_REACH):
+            self._log_reject_throttled(cfg.name, cx, cy, phys_x, phys_y, reach)
+            return None
+
+        # Soft-clamp if slightly beyond max robot reach to keep within reachable envelope
+        if reach > MAX_REACH:
+            scale = (MAX_REACH - 0.5) / reach
+            phys_x *= scale
+            phys_y *= scale
 
         # Step 8: confidence
         norm_area  = min(best_area / 600.0, 1.0)   # 600px = expected dot size at this distance
@@ -401,6 +424,41 @@ class LandmarkDetector:
             area_px=best_area,
             confidence=confidence,
         )
+
+    def _log_reject_throttled(
+        self,
+        name:   str,
+        cx:     float,
+        cy:     float,
+        phys_x: float,
+        phys_y: float,
+        reach:  float,
+    ) -> None:
+        """
+        Emit the out-of-workspace rejection at most once per
+        REJECT_LOG_INTERVAL_S per landmark, folding the suppressed count into
+        the next line so nothing is silently lost.
+        """
+        now  = time.monotonic()
+        last = self._reject_last_log.get(name)
+
+        if last is not None and (now - last) < REJECT_LOG_INTERVAL_S:
+            self._reject_suppressed[name] = self._reject_suppressed.get(name, 0) + 1
+            return
+
+        skipped = self._reject_suppressed.get(name, 0)
+        suffix  = f" ({skipped} more since last message)" if skipped else ""
+
+        logger.warning(
+            "%s at pixel (%.0f,%.0f) maps to (%.1f, %.1f) cm — reach "
+            "%.1f cm is outside [%.1f, %.1f]. Rejecting: the dot is "
+            "outside the calibrated workspace, so move it closer to the "
+            "arm or recalibrate to cover it.%s",
+            name, cx, cy, phys_x, phys_y, reach, MIN_REACH, MAX_REACH, suffix,
+        )
+
+        self._reject_last_log[name]   = now
+        self._reject_suppressed[name] = 0
 
     # ------------------------------------------------------------------
     # Interactive HSV tuner (run standalone)

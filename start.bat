@@ -1,0 +1,3 @@
+@echo off
+echo Starting RoboSurge Full-Stack System...
+py -3.11 start.py %* 2>nul || python start.py %*

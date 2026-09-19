@@ -81,7 +81,7 @@ logger = logging.getLogger("SensorFusion")
 # Constants
 # ---------------------------------------------------------------------------
 
-SERIAL_PORT:    str   = "COM6"
+SERIAL_PORT:    str   = "COM5"   # CP210x USB-UART; COM6/COM7 are Bluetooth here
 SERIAL_BAUD:    int   = 115200
 SERIAL_TIMEOUT: float = 0.02     # 20 ms write timeout — keeps the loop non-blocking
 LOOP_RATE_HZ:   float = 10.0
@@ -313,6 +313,8 @@ class LocalAffineMapper:
             )
         self._phys = np.asarray(physical_pts, dtype=np.float64)  # (N, 2)
         self._pix  = np.asarray(pixel_pts,    dtype=np.float64)  # (N, 2)
+        design_all = np.hstack([self._pix, np.ones((len(self._pix), 1))])
+        self._A_global, *_ = np.linalg.lstsq(design_all, self._phys, rcond=None)
         logger.info(
             "LocalAffineMapper ready: %d calibration points, k=%d neighbors.",
             len(self._pix), self._k,
@@ -361,9 +363,17 @@ class LocalAffineMapper:
 
     def pixel_to_physical(self, u: float, v: float) -> tuple[float, float]:
         """Project one pixel observation into physical table-plane cm."""
-        A   = self._fit_local_affine(u, v)
-        vec = np.array([u, v, 1.0], dtype=np.float64)
-        out = vec @ A
+        query = np.array([u, v], dtype=np.float64)
+        min_dist = float(np.min(np.linalg.norm(self._pix - query, axis=1)))
+        
+        A_local = self._fit_local_affine(u, v)
+        vec     = np.array([u, v, 1.0], dtype=np.float64)
+        local_xy = vec @ A_local
+        global_xy = vec @ self._A_global
+        
+        # Smoothly blend local fit with global affine if outside nearest cluster
+        blend = float(np.clip((min_dist - 60.0) / 120.0, 0.0, 1.0))
+        out = (1.0 - blend) * local_xy + blend * global_xy
         return (float(out[0]), float(out[1]))
 
     def leave_one_out_errors(self) -> list[float]:
